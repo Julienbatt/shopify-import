@@ -1,0 +1,451 @@
+var script_time_limit = 180000; // in ms, 4 minutes maximum
+var product_regexp = ['pack-5', 'pack-10', '10-pack', '5-pack'];
+var product_tags = ['Marketing', 'Galaxus'];
+
+var ss = SpreadsheetApp.getActive();
+var input_sheet = ss.getSheetByName('Input');
+var last_date_cell = 'Q1';
+var last_date_value = input_sheet.getRange(last_date_cell).getValue();
+var yearN = input_sheet.getRange('yearN').getValue();
+var order_id_to_check = input_sheet.getRange('orderIDtocheck').getValue();
+
+function main() {
+  for (var num = yearN - 2; num <= yearN; num++) {
+    if (!write_orders(num)) return;
+  }
+}
+
+function write_orders(year) {
+  var sheet_num = yearN - year;
+  var sheet_postfix = (sheet_num > 0) ? ('-' + sheet_num) : '';
+  var sheet_name = 'Orders N' + sheet_postfix;
+  
+  var orders_sheet = ss.getSheetByName(sheet_name);
+  if (orders_sheet == null) {
+    orders_sheet = ss.insertSheet();
+    orders_sheet.setName(sheet_name);
+  }
+
+  var refunds_sheet_name = 'Refunds';
+  var refunds_sheet = ss.getSheetByName(refunds_sheet_name);
+  if (refunds_sheet == null) {
+    refunds_sheet = ss.insertSheet();
+    refunds_sheet.setName(refunds_sheet_name);
+  }
+  var current_refunds_row = refunds_sheet.getLastRow() + 1;
+
+  var startColumn = 'A';
+  var current_row = orders_sheet.getLastRow() + 1;
+  var write_total = false;
+  
+  var total_row = 0;
+  if (current_row > 1) {
+    var last_row = current_row - 1;
+    if (orders_sheet.getRange(startColumn + last_row).getValue() == 'Total') {
+      total_row = last_row;
+    }
+  }
+
+  var today = new Date();
+  var date = new Date(year, 0, 1);
+  if (last_date_value != '') {
+    var last_date = new Date(last_date_value);
+    if (last_date > 0 && last_date.getFullYear() >= year) {
+      date = last_date;
+      if (!is_same_day(today, date)) 
+        date.setDate(date.getDate() + 1);
+    }
+  }
+
+  if (current_row == 1) {
+    var headers = [['Date', 'ID', 'Order Number', 'Financial Status', 'Created At', 'Total Price', 'Refund Total Amount', 'Refunded At', 'Discount code', 'Discount Amount', 'LineItem Status', 'LineItem Quantity', 'LineItem Name', 'LineItem Price', 'LineItem Total Price', 'LineItem Total Price Netto', 'LineItem Compare At Price', 'LineItem Total Compare At Price', '% Discount', 'Commission Level', 'Commissions CHF', 'Commissions CHF Netto', 'AnneeReturn', 'MoisReturn', 'ConcatVlookupReturn', 'SKU', 'Tags', 'Annee', 'Mois', 'ConcatVlookup', 'Jour', 'ConcatJour', 'API Currency', 'Exchange Rate', 'SommeTotal', 'Discount', 'Concatorders', 'Count orders', 'SKUcount', 'TagCount']];
+    write_values(orders_sheet, startColumn, current_row++, headers);
+  }
+
+  if (current_refunds_row == 1) {
+    var headers = [['Refund Date', 'Order Number', 'Refund Total Amount']];
+    write_values(refunds_sheet, startColumn, current_refunds_row++, headers);
+  }
+  
+  while (date.getFullYear() == year) {
+    if (date > today) break;
+
+    var now = Date.now();
+    if (now - script_start > script_time_limit) {
+      Logger.log('Script time limit reached. Run script again to continue.');
+      return false;
+    }
+
+    if (is_same_day(date, today)) {
+      var dates = orders_sheet.getRange('A:A').getValues();
+      var last_date_found = false;
+      dates.forEach((item, i) => {
+        if (item == '' || last_date_found) 
+          return false;
+        if (is_same_day(new Date(item), today)) {
+          current_row = i + 1;
+          total_row = 0;
+          last_date_found = true;
+          return false;
+        }
+      });
+    }
+
+    var month = date.getMonth() + 1;
+    if (month < 10) month = '0' + month;
+    var day = date.getDate();
+    if (day < 10) day = '0' + day;
+    var date_str = year + '-' + month + '-' + day;
+
+    Logger.log('Getting orders from ' + date_str);
+
+    var orders_created_range = '&created_at_min=' + date_str + 'T00:00:00+02:00&created_at_max=' + date_str + 'T23:59:59+02:00';
+    var url = '/orders.json?status=any&limit=250' + orders_created_range;
+    var json = get_json(url);
+    if ('orders' in json && json.orders.length > 0) {
+      for (var num = 0; num < json.orders.length; num++) {
+        var order = json.orders[num];
+
+        Logger.log('Processing order ' + order.id);
+
+        var order_created_at = order.created_at;
+        order_created_at = order_created_at.slice(0, 10);
+        // var removed_items_total_amount = 0;
+        var refund_total_amount = 0;
+        var refunded_at = '';
+
+        if (order.refunds.length > 0) {
+          for (var num1 = 0; num1 < order.refunds.length; num1++) {
+            var refund = order.refunds[num1];
+
+            if (refund.transactions.length > 0) {
+              for (var num2 = 0; num2 < refund.transactions.length; num2++) {
+                var transaction = refund.transactions[num2];
+
+                if (transaction.kind == 'refund') {
+                  refund_total_amount += parseFloat(transaction.amount);
+                  refunded_at += transaction.processed_at;
+                }
+              }
+            }
+          }
+
+          if (refund_total_amount > 0) {
+            var line = [[refunded_at.slice(0, 10), '#' + order.order_number.toString(), refund_total_amount]];
+            write_values(refunds_sheet, startColumn, current_refunds_row++, line);
+          }
+        }
+
+        // if (order.line_items.length > 0) {
+        //   for (var num1 = 0; num1 < order.line_items.length; num1++) {
+        //     var line_item = order.line_items[num1];
+
+        //     if (line_item.fulfillment_status == null || line_item.gift_card == true) {
+        //       var line_item_discount = ('discount_allocations' in line_item && line_item.discount_allocations.length > 0) 
+        //         ? parseFloat(line_item.discount_allocations[0].amount) 
+        //         : '';
+        //       var line_item_price = parseFloat(line_item.price);
+        //       var line_item_total_price = line_item_price * line_item.quantity;
+        //       var line_item_total_price_netto = (line_item_discount != '') 
+        //         ? (line_item_total_price - line_item_discount) 
+        //         : line_item_total_price;
+
+        //       removed_items_total_amount += parseFloat(line_item_total_price_netto);
+        //     }
+        //   }
+        // }
+
+        var order_total_price = ('total_price' in order) ? parseFloat(order.total_price) : 0;
+        // if (refund_total_amount == 0) {
+        //   order_total_price -= removed_items_total_amount;
+        // }
+
+        var is_first_order_line = true;
+        if (order.line_items.length > 0) {
+          for (var num1 = 0; num1 < order.line_items.length; num1++) {
+            var line_item = order.line_items[num1];
+
+            var line_item_status = line_item.fulfillment_status;
+            var line_item_name = line_item.name.toLowerCase();
+            var line_item_discount = ('discount_allocations' in line_item && line_item.discount_allocations.length > 0) 
+              ? parseFloat(line_item.discount_allocations[0].amount) 
+              : '';
+            var line_item_price = parseFloat(line_item.price);
+            var line_item_total_price = line_item_price * line_item.quantity;
+            var line_item_total_price_netto = (line_item_discount != '') 
+              ? line_item_total_price - line_item_discount 
+              : line_item_total_price;
+            var line_item_compare_at_price = get_product_variant_compare_at_price(line_item.variant_id, line_item_price);
+            var line_item_total_compare_at_price = line_item_compare_at_price * line_item.quantity;
+            var line_item_discount_percentage = Math.round((1 - line_item_total_price_netto / line_item_total_compare_at_price) * 100) / 100;
+            var line_item_commission_level = 0;
+
+            if (line_item_status != null && order_total_price > 0) {
+              var is_pack = false;
+              for (var num2 = 0; num2 < product_regexp.length; num2++) {
+                if (line_item_name.indexOf(product_regexp[num2]) != -1) {
+                  is_pack = true;
+                  break;
+                }
+              }
+
+              if (is_pack) {
+                line_item_commission_level = 0.06;
+              } else if (line_item_discount_percentage <= 0.30) {
+                line_item_commission_level = 0.12;
+              }
+            }
+
+            var line = is_first_order_line 
+              ? [
+                  [
+                    order_created_at,
+                    ('id' in order) ? order.id.toString() : '',
+                    ('order_number' in order) ? '#' + order.order_number.toString() : '',
+                    ('financial_status' in order) ? order.financial_status.toString() : '',
+                    ('created_at' in order) ? order.created_at.toString() : '',
+                    order_total_price.toString(),
+                    (refund_total_amount > 0) ? refund_total_amount.toString() : '',
+                    refunded_at,
+                    ('discount_codes' in order && order.discount_codes.length > 0) ? order.discount_codes[0].code : '',
+                    line_item_discount,
+                    (line_item_status != null) ? line_item_status : 'unfulfilled/removed',
+                    ('quantity' in line_item) ? line_item.quantity.toString() : '',
+                    ('name' in line_item) ? line_item.name.toString() : '',
+                    line_item_price,
+                    '=N' + current_row + '*L' + current_row,
+                    '=O' + current_row + '-J' + current_row,
+                    line_item_compare_at_price,
+                    '=Q' + current_row + '*L' + current_row,
+                    '=1-P' + current_row + '/R' + current_row,
+                    line_item_commission_level,
+                    '=O' + current_row + '*T' + current_row,
+                    '=P' + current_row + '*T' + current_row,
+                    '=IF(H' + current_row + '="";"";VALUE(LEFT(H' + current_row + ',4)))',
+                    '=IF(H' + current_row + '="";"";MID(H' + current_row + ';6;2))',
+                    '=IF(H' + current_row + '="";"";IFERROR(VLOOKUP(X' + current_row + ';Input!$I$2:$J$13,2,FALSE)&W' + current_row + ';""))',
+                    ('sku' in line_item) ? line_item.sku.toString() : '',
+                    get_product_tags(line_item.product_id),
+                    '=IF(A' + current_row + '="";"";VALUE(LEFT(A' + current_row + ',4)))',
+                    '=IF(A' + current_row + '="";"";MID(A' + current_row + ';6;2))',
+                    '=IF(B' + current_row + '="";"";IFERROR(VLOOKUP(AC' + current_row + ';Input!$I$2:$J$13,2,FALSE)&AB' + current_row + ';""))',
+                    '=IF(A' + current_row + '="";"";MID(A' + current_row + ';9;2))',
+                    '=IF(A' + current_row + '="";"";AD' + current_row + '&AE' + current_row + ')',
+                    ('currency' in order) ? order.currency.toString() : '',
+                    '=IF(B' + current_row + '="";"";IF(AG' + current_row + '=currency;1;googlefinance(AG' + current_row + '&currency)))',
+                    '=IF(B' + current_row + '="";"";F' + current_row + '*AH' + current_row + ')',
+                    '=R' + current_row + '-O' + current_row + '',
+                    (current_row == 2) ? '=unique(C2:C;FALSE;FALSE)' : '',
+                    '=IF(AK' + current_row + '="";"";VLOOKUP(AK' + current_row + ';$C$1:$AD;28;FALSE))',
+                    '=IF(OR(ISNUMBER(SEARCH("&",Z' + current_row + ')),ISNUMBER(SEARCH("+",Z' + current_row + '))),"2x11",IF(LEFT(Z' + current_row + ',2)="2x", MID(Z' + current_row + ',4,3),LEFT(Z' + current_row + ',3)))&AD' + current_row + '',
+                    '=IF(AA' + current_row + '="","",IF(OR(ISNUMBER(SEARCH("&",Z' + current_row + ')),ISNUMBER(SEARCH("+",Z' + current_row + '))),"2x11",IF(LEFT(Z' + current_row + ',2)="2x", MID(Z' + current_row + ',4,3),LEFT(Z' + current_row + ',3)))&AA' + current_row + '&AD' + current_row + ')'
+                  ]
+                ]
+              : [
+                  [
+                    order_created_at,
+                    ('id' in order) ? order.id.toString() : '',
+                    ('order_number' in order) ? '#' + order.order_number.toString() : '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    line_item_discount,
+                    (line_item_status != null) ? line_item_status : 'unfulfilled/removed',
+                    ('quantity' in line_item) ? line_item.quantity.toString() : '',
+                    ('name' in line_item) ? line_item.name.toString() : '',
+                    line_item_price,
+                    '=N' + current_row + '*L' + current_row,
+                    '=O' + current_row + '-J' + current_row,
+                    line_item_compare_at_price,
+                    '=Q' + current_row + '*L' + current_row,
+                    '=1-P' + current_row + '/R' + current_row,
+                    line_item_commission_level,
+                    '=O' + current_row + '*T' + current_row,
+                    '=P' + current_row + '*T' + current_row,
+                    '=IF(H' + current_row + '="";"";VALUE(LEFT(H' + current_row + ',4)))',
+                    '=IF(H' + current_row + '="";"";MID(H' + current_row + ';6;2))',
+                    '=IF(H' + current_row + '="";"";IFERROR(VLOOKUP(X' + current_row + ';Input!$I$2:$J$13,2,FALSE)&W' + current_row + ';""))',
+                    ('sku' in line_item) ? line_item.sku.toString() : '',
+                    get_product_tags(line_item.product_id),
+                    '=IF(A' + current_row + '="";"";VALUE(LEFT(A' + current_row + ',4)))',
+                    '=IF(A' + current_row + '="";"";MID(A' + current_row + ';6;2))',
+                    '=IF(B' + current_row + '="";"";IFERROR(VLOOKUP(AC' + current_row + ';Input!$I$2:$J$13,2,FALSE)&AB' + current_row + ';""))',
+                    '=IF(A' + current_row + '="";"";MID(A' + current_row + ';9;2))',
+                    '=IF(A' + current_row + '="";"";AD' + current_row + '&AE' + current_row + ')',
+                    ('currency' in order) ? order.currency.toString() : '',
+                    '=IF(B' + current_row + '="";"";IF(AG' + current_row + '=currency;1;googlefinance(AG' + current_row + '&currency)))',
+                    '=IF(B' + current_row + '="";"";F' + current_row + '*AH' + current_row + ')',
+                    '=R' + current_row + '-O' + current_row + '',
+                    (current_row == 2) ? '=unique(C2:C;FALSE;FALSE)' : '',
+                    '=IF(AK' + current_row + '="";"";VLOOKUP(AK' + current_row + ';$C$1:$AD;28;FALSE))',
+                    '=IF(OR(ISNUMBER(SEARCH("&",Z' + current_row + ')),ISNUMBER(SEARCH("+",Z' + current_row + '))),"2x11",IF(LEFT(Z' + current_row + ',2)="2x", MID(Z' + current_row + ',4,3),LEFT(Z' + current_row + ',3)))&AD' + current_row + '',
+                    '=IF(AA' + current_row + '="","",IF(OR(ISNUMBER(SEARCH("&",Z' + current_row + ')),ISNUMBER(SEARCH("+",Z' + current_row + '))),"2x11",IF(LEFT(Z' + current_row + ',2)="2x", MID(Z' + current_row + ',4,3),LEFT(Z' + current_row + ',3)))&AA' + current_row + '&AD' + current_row + ')'
+                  ]
+                ];
+
+            if (total_row > 0) {
+              current_row--;
+              total_row = 0;
+            }
+
+            write_values(orders_sheet, startColumn, current_row++, line);
+            input_sheet.getRange(last_date_cell).setValue(date_str);
+            is_first_order_line = false;
+          }
+        }
+      }
+
+      write_total = true;
+    }
+
+    date.setDate(date.getDate() + 1);
+  }
+
+  if (write_total) {
+    orders_sheet.getRange(startColumn + current_row).setValue('Total');
+    var last_row = current_row - 1;
+    var columns = ['F', 'G', 'J', 'L', 'O', 'P', 'R', 'U', 'V', 'AI', 'AJ'];
+    for (var num = 0; num < columns.length; num++) {
+      var letter = columns[num];
+      orders_sheet.getRange(current_row, letter_to_column(letter)).setFormula('=SUM(' + letter + '2:' + letter + last_row + ')');
+    }
+  }
+
+  return true;
+}
+
+var script_start = Date.now();
+function check_order_json() {
+  var ss = SpreadsheetApp.getActive();
+  var check_sheet = ss.getSheetByName("Check");
+  check_sheet.getRange("A:DW").clearContent(); 
+  var json = JSON.stringify(get_json('/orders/' + order_id_to_check + '.json'), null, 2);
+  check_sheet.getRange("A1").setValue(json); 
+}
+
+var products_variants_ids = [];
+var products_variants_compare_at_prices = [];
+function get_product_variant_compare_at_price(variant_id, price) {
+  var compare_at_price = price;
+  
+  if (isNaN(parseInt(variant_id))) return compare_at_price;
+
+  var index = products_variants_ids.indexOf(variant_id);
+  if (index == -1) {
+    Logger.log('Getting product variant ' + variant_id);
+
+    var url = '/variants/' + variant_id + '.json?fields=id,compare_at_price';
+    var json = get_json(url);
+    if ('variant' in json && 'compare_at_price' in json.variant && json.variant.compare_at_price != null) {
+      compare_at_price = parseFloat(json.variant.compare_at_price);
+    }
+
+    products_variants_ids.push(variant_id);
+    products_variants_compare_at_prices.push(compare_at_price);
+  } else {
+    compare_at_price = products_variants_compare_at_prices[index];
+  }
+
+  return compare_at_price;
+}
+
+var products_ids = [];
+var products_tags = [];
+function get_product_tags(product_id) {
+  var tags = '';
+  if (isNaN(parseInt(product_id))) return tags;
+
+  var index = products_ids.indexOf(product_id);
+  if (index == -1) {
+    Logger.log('Getting product tags ' + product_id);
+
+    var url = '/products/' + product_id + '.json?fields=id,tags';
+    var json = get_json(url);
+    if ('product' in json && 'tags' in json.product && json.product.tags != null) {
+      tags = json.product.tags;
+    }
+
+    if (product_tags.length > 0 && tags != '') {
+      var sorted_tags = [];
+      var array_tags = tags.split(', ');
+      if (array_tags.length > 0) {
+        product_tags.forEach((product_tag) => {
+          var product_tag_lower = product_tag.trim().toLowerCase();
+          array_tags.forEach((array_tag) => {
+            var array_tag_lower = array_tag.trim().toLowerCase();
+            if (product_tag_lower == array_tag_lower) {
+              sorted_tags.push(product_tag);
+              return false;
+            }
+          });
+        });
+
+        tags = sorted_tags.sort().join(', ');
+      }
+    }
+
+    products_ids.push(product_id);
+    products_tags.push(tags);
+  } else {
+    tags = products_tags[index];
+  }
+
+  return tags;
+}
+
+function write_values(sheet, startColumn, startRow, data) {
+  var rows_count = data.length;
+  var columns_count = data[0].length;
+
+  sheet.getRange(startRow, letter_to_column(startColumn), rows_count, columns_count).setValues(data);
+}
+
+function letter_to_column(letter) {
+  var column = 0, length = letter.length;
+  for (var i = 0; i < length; i++) {
+    column += (letter.toUpperCase().charCodeAt(i) - 64) * Math.pow(26, length - i - 1);
+  }
+
+  return column;
+}
+
+function is_same_day(d1, d2) {
+  return d1.getFullYear() === d2.getFullYear() &&
+    d1.getDate() === d2.getDate() &&
+    d1.getMonth() === d2.getMonth();
+}
+
+var past = 0;
+function get_json(url) {
+  var sleep = 1000;
+  var now = Date.now();
+  if (now - past <= sleep) Utilities.sleep(sleep - now + past);
+  past = Date.now();
+
+  var API = input_sheet.getRange("API").getValue();
+  var username = input_sheet.getRange("sk").getValue();
+  var password = input_sheet.getRange("pw").getValue();
+  var encodedAuthInformation = Utilities.base64Encode(username + ":" + password);
+  var headers = {headers: {Authorization: "Basic " + encodedAuthInformation}, muteHttpExceptions: true};
+  
+  var response = UrlFetchApp.fetch(API + url, headers);
+  if (response.getResponseCode() == 200) {
+    return JSON.parse(response);
+  } else {
+    return {}
+  }
+}
+
+var product_variant_id_to_check = 36753843290274;
+function check_product_variant_json() {
+  var ss = SpreadsheetApp.getActive();
+  var check_sheet = ss.getSheetByName("Check");
+  check_sheet.getRange("A:DW").clearContent(); 
+  var json = JSON.stringify(get_json('/variants/' + product_variant_id_to_check + '.json'), null, 2);
+  check_sheet.getRange("A1").setValue(json);
+}
+
+
